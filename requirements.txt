@@ -8,4 +8,5 @@ faiss-cpu
 python-dotenv
 requests
 streamlit-lottie
-
+pypdf
+PyPDFDirectoryLoader
