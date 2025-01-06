@@ -1,0 +1,11 @@
+streamlit==1.25.0
+langchain==0.0.340
+langchain-community==0.0.14
+langchain-core==0.1.8
+langchain-groq==0.0.5
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
+python-dotenv==1.0.0
+requests==2.31.0
+streamlit-lottie==0.0.5
+
