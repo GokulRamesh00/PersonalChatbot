@@ -11,14 +11,15 @@ import requests
 from streamlit_lottie import st_lottie
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.document_loaders import Docx2txtLoader
-from langchain_community.document_loaders import TextLoader
 import logging
-from langchain.retrievers.multi_query import MultiQueryRetriever
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Create directories
+os.makedirs("./model_cache", exist_ok=True)
+os.makedirs("./vector_store", exist_ok=True)
 
 # Load environment variables
 load_dotenv()
@@ -90,7 +91,7 @@ st.markdown(
 @st.cache_resource(show_spinner=False)
 def initialize_components():
     try:
-        # Initialize LLM with more temperature to allow creative responses
+        # Initialize LLM
         llm = ChatGroq(
             groq_api_key=groq_api_key,
             model_name="Llama3-8b-8192",
@@ -98,13 +99,34 @@ def initialize_components():
             max_tokens=4096
         )
         
+        # Check if we have a pre-saved vector store
+        vector_store_path = "./vector_store"
+        
+        if os.path.exists(vector_store_path) and os.listdir(vector_store_path):
+            try:
+                # Initialize embeddings
+                embeddings = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/all-MiniLM-L6-v2",
+                    model_kwargs={'device': 'cpu'},
+                    cache_folder="./model_cache"
+                )
+                
+                # Try to load the vector store from disk
+                vectors = FAISS.load_local(vector_store_path, embeddings)
+                logger.info(f"Successfully loaded vector store from {vector_store_path}")
+                return llm, vectors
+            except Exception as e:
+                logger.warning(f"Failed to load vector store from disk: {str(e)}. Will recreate.")
+                # Continue with creating a new vector store
+        
         # Initialize embeddings
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}
+            model_kwargs={'device': 'cpu'},
+            cache_folder="./model_cache"
         )
         
-        # Load only the main documents - no FAQ
+        # Load the PDF
         documents = []
         
         # Main PDF
@@ -117,29 +139,6 @@ def initialize_components():
                 doc.metadata["source"] = "chatbot.pdf"
             documents.extend(pdf_docs)
             logger.info(f"Loaded PDF from {pdf_path} - {len(pdf_docs)} pages")
-        
-        # DOCX file
-        docx_path = "./Docs/chatbot.docx"
-        if os.path.exists(docx_path):
-            docx_loader = Docx2txtLoader(docx_path)
-            docx_docs = docx_loader.load()
-            # Add metadata to track source
-            for doc in docx_docs:
-                doc.metadata["source"] = "chatbot.docx"
-            documents.extend(docx_docs)
-            logger.info(f"Loaded DOCX from {docx_path} - {len(docx_docs)} pages")
-        
-        # Resume text file - include only if PDF/DOCX not found
-        if len(documents) == 0:
-            resume_path = "./Docs/resume.txt"
-            if os.path.exists(resume_path):
-                resume_loader = TextLoader(resume_path)
-                resume_docs = resume_loader.load()
-                # Add metadata to track source
-                for doc in resume_docs:
-                    doc.metadata["source"] = "resume.txt"
-                documents.extend(resume_docs)
-                logger.info(f"Loaded resume from {resume_path} - {len(resume_docs)} pages")
         
         if not documents:
             raise Exception("No documents found to process")
@@ -155,6 +154,13 @@ def initialize_components():
         
         # Create vector store
         vectors = FAISS.from_documents(chunks, embeddings)
+        
+        # Save the vector store to disk for future use
+        try:
+            vectors.save_local(vector_store_path)
+            logger.info(f"Successfully saved vector store to {vector_store_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save vector store to disk: {str(e)}")
         
         logger.info(f"Successfully processed {len(documents)} documents with {len(chunks)} chunks")
         return llm, vectors
@@ -208,11 +214,11 @@ if user_input and user_input != st.session_state.last_processed_message:
         st.session_state.last_processed_message = user_input
         st.session_state.chat_history.append({"role": "user", "content": user_input})
 
-        # Create prompt that allows more creative responses
+        # Create prompt template
         prompt = ChatPromptTemplate.from_template(
-            """You are Gokul's personal AI assistant. You MUST use the following retrieved information about Gokul to answer questions accurately.
+            """You are Gokul's personal AI assistant. Use the following information about Gokul to answer questions.
 
-            Retrieved Information about Gokul:
+            Information about Gokul:
             {context}
 
             IMPORTANT BACKGROUND INFORMATION ABOUT GOKUL (Include this information only when directly relevant):
@@ -226,48 +232,23 @@ if user_input and user_input != st.session_state.last_processed_message:
             Human Question: {input}
 
             Instructions:
-            - ONLY use information from chatbot.pdf or chatbot.docx for your answers
-            - NEVER reference a FAQ file in your answers
+            - ONLY use information from chatbot.pdf for your answers
             - Be comprehensive and include ALL relevant details from the retrieved information
             - If the information isn't in the retrieved documents, say so clearly
             - Present information in a clear, friendly and conversational way
             - Use bullet points for structured information when appropriate
 
-            Assistant:"""
+            Answer:"""
         )
         
         # Create retrieval chain
         document_chain = create_stuff_documents_chain(llm, prompt)
-        
-        # Create a simple retriever with sufficient k value to get comprehensive results
-        retriever = vectors.as_retriever(search_kwargs={"k": 15})
+        retriever = vectors.as_retriever(search_kwargs={"k": 10})
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
         with st.spinner("Thinking..."):
-            response = retrieval_chain.invoke({
-                'input': user_input
-            })
-            
-            # Debug logging to understand what was retrieved
-            if 'context' in response:
-                retrieved_docs = response['context']
-                logger.info(f"Retrieved {len(retrieved_docs)} documents for LLM context")
-                
-                # Count documents by source
-                source_counts = {}
-                for doc in retrieved_docs:
-                    source = doc.metadata.get("source", "unknown")
-                    source_counts[source] = source_counts.get(source, 0) + 1
-                
-                logger.info(f"Documents by source: {source_counts}")
-                
-                # Log first 100 chars of each document
-                for i, doc in enumerate(retrieved_docs):
-                    source = doc.metadata.get("source", "unknown")
-                    logger.info(f"Doc {i+1} from {source}: {doc.page_content[:100]}...")
-            
+            response = retrieval_chain.invoke({"input": user_input})
             answer = response['answer'].strip()
-            
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
         increment_input_key()
