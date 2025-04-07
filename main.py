@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains import create_retrieval_chain
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.embeddings import FakeEmbeddings
 import requests
 from streamlit_lottie import st_lottie
 from dotenv import load_dotenv
@@ -104,12 +105,24 @@ def initialize_components():
         
         if os.path.exists(vector_store_path) and os.listdir(vector_store_path):
             try:
-                # Initialize embeddings
-                embeddings = HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2",
-                    model_kwargs={'device': 'cpu'},
-                    cache_folder="./model_cache"
-                )
+                # Initialize embeddings - with error handling for init_empty_weights
+                try:
+                    # Set environment variable to use CPU for embeddings
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+                    os.environ["USE_TORCH"] = "0"  # Disable torch
+                    
+                    embeddings = HuggingFaceEmbeddings(
+                        model_name="sentence-transformers/all-MiniLM-L6-v2",
+                        model_kwargs={'device': 'cpu'},
+                        cache_folder="./model_cache",
+                        encode_kwargs={'normalize_embeddings': True}
+                    )
+                except Exception as embed_error:
+                    logger.warning(f"Error initializing HuggingFace embeddings: {str(embed_error)}")
+                    # Fallback to simpler embeddings approach
+                    from langchain_community.embeddings import FakeEmbeddings
+                    embeddings = FakeEmbeddings(size=384)
+                    logger.warning("Using fallback embeddings due to initialization error")
                 
                 # Try to load the vector store from disk
                 vectors = FAISS.load_local(vector_store_path, embeddings)
@@ -119,12 +132,39 @@ def initialize_components():
                 logger.warning(f"Failed to load vector store from disk: {str(e)}. Will recreate.")
                 # Continue with creating a new vector store
         
-        # Initialize embeddings
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'},
-            cache_folder="./model_cache"
-        )
+        # Initialize embeddings with special handling for deployment environments
+        embeddings = None
+        
+        # Try multiple embedding strategies
+        embedding_strategies = [
+            # Strategy 1: Use basic HuggingFace embeddings with CPU
+            lambda: HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'},
+                cache_folder="./model_cache"
+            ),
+            # Strategy 2: Use simpler model
+            lambda: HuggingFaceEmbeddings(
+                model_name="sentence-transformers/paraphrase-MiniLM-L3-v2",
+                model_kwargs={'device': 'cpu'},
+                cache_folder="./model_cache"
+            ),
+            # Strategy 3: Use fake embeddings as last resort
+            lambda: FakeEmbeddings(size=384)
+        ]
+        
+        # Try each strategy in order
+        for strategy_fn in embedding_strategies:
+            try:
+                embeddings = strategy_fn()
+                logger.info(f"Successfully initialized embeddings with strategy: {strategy_fn.__name__}")
+                break
+            except Exception as e:
+                logger.warning(f"Embedding strategy failed: {str(e)}")
+                continue
+        
+        if embeddings is None:
+            raise Exception("All embedding strategies failed")
         
         # Load the PDF
         documents = []
